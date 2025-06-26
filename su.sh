@@ -16,26 +16,101 @@
 # Uncomment and set the variables below
 
 # The name of the server, used for tracking updates installed on this server
-server_name="chris-desktop"
+SERVER_NAME="chris-desktop"
 
 # The position of the update files, absolute path or relative to the working
 # directory
-base_path="./update-files"
+BASE_PATH="./update-files"
 
 # The command to install packages using the package manager
 # Substitute position of package names with {..} if multiple packages are
 # supported or {} if only one package at a time is supported
-#package_manager_command="sudo apt-get install -y {..}"
-package_manager_command="doas pacman -Syu --noconfirm {..}"
+#PACKAGE_MANAGER_COMMAND="sudo apt-get install -y {..}"
+PACKAGE_MANAGER_COMMAND="doas pacman -Syu --noconfirm {..}"
 
 # List dependencies required by project that can be installed using the package
 # manager
-dependencies=("nodejs" "mariadb-server" "mariadb-client" "python3")
+DEPENDENCIES=("nodejs" "mariadb-server" "mariadb-client" "python3")
 # -------- End Variables --------
+
+# Global variables
+SELECTED_ID=""
+SELECTED_UPDATE=""
+ACTION=""
+FILE_ID=""
+FILENAME=""
+
+function init {
+    # Check dependencies
+    # Check if sqlite3 is installed, as it is required by this script
+    if ! [ -x "$(command -v sqlite3)" ]; then
+        echo 'Error: sqlite3 is not installed.' >&2
+        exit 1
+    fi
+
+    # If the server name is not set, set it to the hostname
+    if [ -z "$SERVER_NAME" ]; then
+        echo "WARNING: Server name is not set, using hostname as server name"
+        SERVER_NAME=$(hostname)
+    fi
+
+    # If the base path is not set, set it to a falder named "update-files" in the
+    # current working directory
+    if [ -z "$BASE_PATH" ]; then
+        echo "WARNING: Base path is not set,  using './update-files' as base path"
+        BASE_PATH="./update-files/"
+    else
+        # Append a trailing slash to the base path if it does not already have one
+        if [ "${BASE_PATH: -1}" != "/" ]; then
+        BASE_PATH="$BASE_PATH/"
+        fi
+    fi
+
+    # Ensure the base path exists and is readable
+    if [ ! -d "$BASE_PATH" ]; then
+        echo "ERROR: Base path '$BASE_PATH' does not exist or is not readable"
+        exit 1
+    fi
+
+    # Set the path to the sqlite database
+    db_path="$BASE_PATH/data/updates.db"
+
+    # Create sqlite database if it does not exist
+    # Create ./data directory if it does not exist
+    if [ ! -f "$db_path" ]; then
+    echo "WARNING: Database '${db_path}' does not exist, creating..."
+    mkdir -p "$BASE_PATH/data"
+    sqlite3 "$db_path" "CREATE TABLE updates (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT NOT NULL, deleted INTEGER);"
+    sqlite3 "$db_path" "CREATE TABLE files (id INTEGER PRIMARY KEY, update_id INTEGER NOT NULL, name TEXT, extension TEXT, added_at TEXT, deleted INTEGER, FOREIGN KEY (update_id) REFERENCES updates(id));"
+    sqlite3 "$db_path" "CREATE TABLE hosts (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT);"
+    sqlite3 "$db_path" "CREATE TABLE host_updates (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, update_id INTEGER NOT NULL, installed INTEGER, failed INTEGER, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (update_id) REFERENCES updates(id));"
+    sqlite3 "$db_path" "CREATE TABLE host_files (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, file_id INTEGER NOT NULL, installed INTEGER, failed INTEGER, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (file_id) REFERENCES files(id));"
+    fi
+
+    # Ensure the database is writable
+    # If the database is not writable, exit with an error
+    if [ ! -w "$db_path" ]; then
+        echo "ERROR: Database '$db_path' is not writable"
+        exit 1
+    fi
+
+    # If the database is writable, check if the server name is already in the
+    # database
+    if sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$SERVER_NAME';"; then
+        echo "Found host '$SERVER_NAME' in database"
+    else
+        echo "WARNING: '$SERVER_NAME' not found in database, adding..."
+        sqlite3 "$db_path" "INSERT INTO hosts (name,added_at) VALUES ('$SERVER_NAME',datetime('now'));"
+    fi
+}
 
 # Function to refresh the database, adding new updates and files to the database
 # and marking deleted files as deleted
 function refresh_updates {
+    # List all directories in the base path, omitting the base directory, in reverse
+    # alphabetical order
+    local updates=$(find "$BASE_PATH" -maxdepth 1 -type d | sed "s|$BASE_PATH||" | sed "s|data||")
+
     # Check if everything in $updates is in the database
     for update in $updates; do
         echo $update
@@ -65,14 +140,14 @@ function refresh_files {
     fi
 
     # Check if the argument is a directory
-    if [ ! -d "${base_path}$1" ]; then
+    if [ ! -d "${BASE_PATH}$1" ]; then
         echo "ERROR: Argument '$1' is not a directory"
         exit 1
     fi
 
     # Check if the directory is writable
-    if [ ! -w "${base_path}$1" ]; then
-        echo "ERROR: Directory '${base_path}$1' is not writable"
+    if [ ! -w "${BASE_PATH}$1" ]; then
+        echo "ERROR: Directory '${BASE_PATH}$1' is not writable"
         exit 1
     fi
 
@@ -84,7 +159,7 @@ function refresh_files {
     fi
 
     # Check that every file in the directory is in the database
-    for file in $(find "${base_path}$1" -type f); do
+    for file in $(find "${BASE_PATH}$1" -type f); do
         # Get base name of file and extension as separate variables
         local file_name=$(basename "$file")
         local file_extension="${file_name##*.}"
@@ -101,7 +176,7 @@ function refresh_files {
     # Check that every file in the database is present in the directory, and mark
     # any files that are not present as deleted
     for file in $(sqlite3 "$db_path" "SELECT name FROM files;"); do
-        if ! find "${base_path}$1" -type f | grep -q "$file"; then
+        if ! find "${BASE_PATH}$1" -type f | grep -q "$file"; then
             echo "Marking file '$file' as deleted"
             sqlite3 "$db_path" "UPDATE files SET deleted=1 WHERE name='$file';"
         fi
@@ -118,22 +193,11 @@ function updates_menu {
         return 1
     fi
 
-    # # Get menu items from the database
-    # for update in $updates; do
-    #     local update_id=$(sqlite3 "$db_path" "SELECT id FROM updates WHERE name='$update';")
-    #     menu_items+=("$update_id $update")
-    # done
-    #
-    # # Sort menu items newest first
-    # menu_items=($(printf '%s\n' "${menu_items[@]}" | sort -r))
-    
     while IFS='|' read -r id name; do
-        if [[ -n "$id" && -n "$name" && "$name" != "data" ]]; then
-            menu_items+=("$id $name")
+        if [[ -n "$id" && -n "$name" ]]; then
+            menu_items+=($id $name)
         fi
-    done < <(sqlite3 "$db_path" "SELECT id, name FROM updates WHERE deleted IS NULL OR deleted = 0 ORDER BY name;")
-
-    echo menu_items
+    done < <(sqlite3 "$db_path" "SELECT id, name FROM updates WHERE deleted IS NULL OR deleted = 0 ORDER BY name DESC;")
 
     if [[ ${#menu_items[@]} -eq 0 ]]; then
         dialog --title "No Updates" --msgbox "No updates found" 10 50
@@ -143,18 +207,17 @@ function updates_menu {
     dialog \
         --title "Server Updater" \
         --menu "Select an update:" \
-        20 60 10 \
+        20 60 40 \
         "${menu_items[@]}" \
         2> "$temp_file"
 
     local exit_code=$?
 
     if [[ $exit_code -eq 0 ]]; then
-        local selected_id=$(cat "$temp_file")
-        local selected_name=$(echo "$updates" | sed -n "${selected_id}p")
+        SELECTED_ID=$(cat "$temp_file" | sed -E 's/^([0-9]+).*/\1/')
+        SELECTED_UPDATE=$(cat "$temp_file" | sed -E 's/^[0-9]+ (.*)/\1/')
+
         rm -f "$temp_file"
-        echo "SELECTED_ID=$selected_id"
-        echo "SELECTED_UPDATE=$selected_name"
     else
         rm -f "$temp_file"
         return 1
@@ -174,7 +237,7 @@ function files_menu {
         return 1
     fi
 
-    local server_id=$(sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$server_name';")
+    local server_id=$(sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$SERVER_NAME';")
     
     local query="
     SELECT
@@ -188,29 +251,33 @@ function files_menu {
         COALESCE(hf.failed, 0) as failed
     FROM files f
     LEFT JOIN host_files hf ON f.id = hf.file_id AND hf.host_id = '$server_id'
-    WHERE f.deleted IS NULL OR f.deleted = 0)
+    WHERE f.update_id = $update_id
+    AND f.deleted IS NULL OR f.deleted = 0
     ORDER BY full_name ASC;
     "
 
     # Read files and build menu items
     while IFS='|' read -r id name installed failed; do
-        if [[ -n "$file_id" && -n "$full_name" ]]; then
+        if [[ -n "$id" && -n "$name" ]]; then
             local status_display=""
             local status_colour=""
 
-            if [[ "$failed" == "1" ]]; then
+            if [[ $failed == "1" ]]; then
                 status_display="FAILED"
                 status_color="\Z1"
-            elif [["$installed" == "1" ]]; then
+            elif [[ $installed == "1" ]]; then
                 status_display="INSTALLED"
                 status_color="\Z2"
             else
                 status_display="-"
-                status_color="\Zn"
+                status_color="\Z3"
             fi
 
-            local display_text=$(printf "%-40s %s%s\Zn" "$full_name" "$status_colour" "$status_display")
-            menu_items+=("$id $display_text")
+            # local display_text=$(printf "%-40s %s%s\Zn" "$name" "$status_colour" "$status_display")
+            local display_text="${name}[${status_color}${status_display}\Zn]"
+            # local padded_name=$(printf "%-40s" "$name")
+            # local display_text=$("${padded_name} ${status_colour}${status_display}\Zn")
+            menu_items+=($id $display_text)
         fi
     done < <(sqlite3 "$db_path" "$query")
 
@@ -274,111 +341,45 @@ function files_menu {
 
 function run_update_workflow {
     while true; do
-        # local updates_result=$(updates_menu)
-        updates_menu
-        local updates_status=$?
-
-        if [[ $updates_status -ne 0 ]]; then
-            echo "Exiting due to error"
-            exit 1
-        fi
-
-        eval "$updates_result"
-
-        local files_result=$(files_menu "$UPDATE_ID" "$UPDATE_NAME")
-        local files_status=$?
-
-        if [[ $files_status -eq 0 ]]; then
-            echo "Files menu result:"
-            echo "$files_result"
-
-            eval "$files_result"
-
-            case "$ACTION" in
-                "INSTALL_ALL")
-                    echo "Installing all files for update $UPDATE_ID"
-                    ;;
-                "INSTALL_FAILED")
-                    echo "Retrying failed files for update $UPDATE_ID"
-                    ;;
-                "INSTALL_FILE")
-                    echo "Installing file $FILENAME for update $UPDATE_ID"
-                    ;;
-            esac
-
-            if ! dialog --yesno "Continue with another operation?" 8 40; then
-                break
+        if updates_menu; then
+            if [[ $updates_status -ne 0 ]]; then
+                echo "Exiting due to error"
+                exit 1
             fi
+
+            if files_menu "$SELECTED_ID" "$SELECTED_UPDATE"; then
+                echo "Files menu action: $ACTION"
+
+                case "$ACTION" in
+                    "INSTALL_ALL")
+                        echo "Installing all files for update $UPDATE_ID"
+                        read -r ans
+                        ;;
+                    "INSTALL_FAILED")
+                        echo "Retrying failed files for update $UPDATE_ID"
+                        read -r ans
+                        ;;
+                    "INSTALL_FILE")
+                        echo "Installing file $FILENAME for update $UPDATE_ID"
+                        read -r ans
+                        ;;
+                esac
+
+                if ! dialog --yesno "Continue with another operation?" 8 40; then
+                    break
+                fi
+            fi
+        else
+            echo "Updates menu cancelled or failed"
+            break
         fi
     done
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then 
-    # Check dependencies
-    # Check if sqlite3 is installed, as it is required by this script
-    if ! [ -x "$(command -v sqlite3)" ]; then
-        echo 'Error: sqlite3 is not installed.' >&2
-        exit 1
-    fi
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    init
 
-    # If the server name is not set, set it to the hostname
-    if [ -z "$server_name" ]; then
-        echo "WARNING: Server name is not set, using hostname as server name"
-        server_name=$(hostname)
-    fi
-
-    # If the base path is not set, set it to a falder named "update-files" in the
-    # current working directory
-    if [ -z "$base_path" ]; then
-        echo "WARNING: Base path is not set,  using './update-files' as base path"
-        base_path="./update-files/"
-    else
-        # Append a trailing slash to the base path if it does not already have one
-        if [ "${base_path: -1}" != "/" ]; then
-        base_path="$base_path/"
-        fi
-    fi
-
-    # Ensure the base path exists and is readable
-    if [ ! -d "$base_path" ]; then
-        echo "ERROR: Base path '$base_path' does not exist or is not readable"
-        exit 1
-    fi
-
-    # Set the path to the sqlite database
-    db_path="$base_path/data/updates.db"
-
-    # List all directories in the base path, omitting the base directory, in reverse
-    # alphabetical order
-    updates=$(find "$base_path" -maxdepth 1 -type d | sed "s|$base_path||" | sed "s|data||")
-
-    # Create sqlite database if it does not exist
-    # Create ./data directory if it does not exist
-    if [ ! -f "$db_path" ]; then
-    echo "WARNING: Database '${db_path}' does not exist, creating..."
-    mkdir -p "$base_path/data"
-    sqlite3 "$db_path" "CREATE TABLE updates (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT NOT NULL, deleted INTEGER);"
-    sqlite3 "$db_path" "CREATE TABLE files (id INTEGER PRIMARY KEY, update_id INTEGER NOT NULL, name TEXT, extension TEXT, added_at TEXT, deleted INTEGER, FOREIGN KEY (update_id) REFERENCES updates(id));"
-    sqlite3 "$db_path" "CREATE TABLE hosts (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT);"
-    sqlite3 "$db_path" "CREATE TABLE host_updates (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, update_id INTEGER NOT NULL, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (update_id) REFERENCES updates(id));"
-    sqlite3 "$db_path" "CREATE TABLE host_files (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, file_id INTEGER NOT NULL, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (file_id) REFERENCES files(id));"
-    fi
-
-    # Ensure the database is writable
-    # If the database is not writable, exit with an error
-    if [ ! -w "$db_path" ]; then
-        echo "ERROR: Database '$db_path' is not writable"
-        exit 1
-    fi
-
-    # If the database is writable, check if the server name is already in the
-    # database
-    if sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$server_name';"; then
-        echo "Found host '$server_name' in database"
-    else
-        echo "WARNING: '$server_name' not found in database, adding..."
-        sqlite3 "$db_path" "INSERT INTO hosts (name,added_at) VALUES ('$server_name',datetime('now'));"
-    fi
+    refresh_updates
 
     run_update_workflow
 fi
