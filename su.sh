@@ -113,9 +113,6 @@ function refresh_updates {
         local uninstalled_count=0
         local query_result=""
 
-        # Refresh files in the update
-        refresh_files "$update"
-
         # Check if the update is in the database, if so set update_id
         if ! sqlite3 "$db_path" "SELECT name FROM updates WHERE name='$update';" | grep -q "$update"; then
             # If the update is not in the database, add it
@@ -125,6 +122,9 @@ function refresh_updates {
 
         # Set update_id
         update_id=$(sqlite3 "$db_path" "SELECT id FROM updates WHERE name='$update';")
+
+        # Refresh files in the update
+        refresh_files "$update"
 
         # If any file in the update is not in the database, add it
         for file in $(find "$BASE_PATH$update" -type f); do
