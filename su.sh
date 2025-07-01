@@ -12,28 +12,17 @@
 # updates all at once or one at a time, and track the success or failure of each
 # update.
 
-# -------- Variables --------
-# Uncomment and set the variables below
+# If .env file does not exist, exit with an error
+if [ ! -f ".env" ]; then
+    echo "ERROR: Environment file '.env' does not exist"
+    echo "Copy '.env.default' to '.env' and edit to set variables"
+    exit 1
+fi
 
-# The name of the server, used for tracking updates installed on this server
-SERVER_NAME="chris-desktop"
-
-# The position of the update files, absolute path or relative to the working
-# directory
-BASE_PATH="./update-files"
-
-# The command to install packages using the package manager
-# Substitute position of package names with {..} if multiple packages are
-# supported or {} if only one package at a time is supported
-#PACKAGE_MANAGER_COMMAND="sudo apt-get install -y {..}"
-PACKAGE_MANAGER_COMMAND="doas pacman -Syu --noconfirm {..}"
-
-# List dependencies required by project that can be installed using the package
-# manager
-DEPENDENCIES=("nodejs" "mariadb-server" "mariadb-client" "python3")
-# -------- End Variables --------
+source .env
 
 # Global variables
+HOST_ID=""
 SELECTED_ID=""
 SELECTED_UPDATE=""
 ACTION=""
@@ -73,7 +62,7 @@ function init {
     fi
 
     # Set the path to the sqlite database
-    db_path="$BASE_PATH/data/updates.db"
+    db_path="${BASE_PATH}data/updates.db"
 
     # Create sqlite database if it does not exist
     # Create ./data directory if it does not exist
@@ -83,7 +72,7 @@ function init {
     sqlite3 "$db_path" "CREATE TABLE updates (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT NOT NULL, deleted INTEGER);"
     sqlite3 "$db_path" "CREATE TABLE files (id INTEGER PRIMARY KEY, update_id INTEGER NOT NULL, name TEXT, extension TEXT, added_at TEXT, deleted INTEGER, FOREIGN KEY (update_id) REFERENCES updates(id));"
     sqlite3 "$db_path" "CREATE TABLE hosts (id INTEGER PRIMARY KEY, name TEXT UNIQUE, added_at TEXT);"
-    sqlite3 "$db_path" "CREATE TABLE host_updates (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, update_id INTEGER NOT NULL, installed INTEGER, failed INTEGER, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (update_id) REFERENCES updates(id));"
+    sqlite3 "$db_path" "CREATE TABLE host_updates (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, update_id INTEGER NOT NULL, installed INTEGER, empty INTEGER, failed INTEGER, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (update_id) REFERENCES updates(id));"
     sqlite3 "$db_path" "CREATE TABLE host_files (id INTEGER PRIMARY KEY, host_id INTEGER NOT NULL, file_id INTEGER NOT NULL, installed INTEGER, failed INTEGER, FOREIGN KEY (host_id) REFERENCES hosts(id), FOREIGN KEY (file_id) REFERENCES files(id));"
     fi
 
@@ -98,6 +87,8 @@ function init {
     # database
     if sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$SERVER_NAME';"; then
         echo "Found host '$SERVER_NAME' in database"
+        # Set global variable for host id
+        HOST_ID=$(sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$SERVER_NAME';")
     else
         echo "WARNING: '$SERVER_NAME' not found in database, adding..."
         sqlite3 "$db_path" "INSERT INTO hosts (name,added_at) VALUES ('$SERVER_NAME',datetime('now'));"
@@ -113,19 +104,74 @@ function refresh_updates {
 
     # Check if everything in $updates is in the database
     for update in $updates; do
-        echo $update
-        # Check if the update is in the database
-        if ! sqlite3 "$db_path" "SELECT id FROM updates WHERE name='$update';" | grep -q "$update"; then
+        local installed=0
+        local failed=0
+        local empty=0
+        local update_id=""
+        local file_count=0
+        local failed_count=0
+        local uninstalled_count=0
+        local query_result=""
+
+        # Refresh files in the update
+        refresh_files "$update"
+
+        # Check if the update is in the database, if so set update_id
+        if ! sqlite3 "$db_path" "SELECT name FROM updates WHERE name='$update';" | grep -q "$update"; then
             # If the update is not in the database, add it
             echo "Adding update '$update' to database"
             sqlite3 "$db_path" "INSERT INTO updates (name,added_at) VALUES ('$update',datetime('now'));"
         fi
+
+        # Set update_id
+        update_id=$(sqlite3 "$db_path" "SELECT id FROM updates WHERE name='$update';")
+
+        # If any file in the update is not in the database, add it
+        for file in $(find "$BASE_PATH$update" -type f); do
+            # Get base name of file and extension as separate variables
+            local file_name=$(basename "$file")
+            local file_extension="${file_name##*.}"
+            file_name="${file_name%.*}"
+
+            # Check if the file is in the database
+            if ! sqlite3 "$db_path" "SELECT name FROM files WHERE name='$file_name' AND extension='$file_extension' AND update_id=(SELECT id FROM updates WHERE name='$update');" | grep -q "$file_name"; then
+                # If the file is not in the database, add it
+                echo "Adding file '$file' to database"
+                sqlite3 "$db_path" "INSERT INTO files (name,extension,added_at,update_id) VALUES ('$file_name','$file_extension',datetime('now'),(SELECT id FROM updates WHERE name='$update'));"
+            fi
+        done
+
+        # Check if host_updates table has an entry for the update
+        query_result=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM host_updates WHERE host_id='$HOST_ID' AND update_id='$update_id';")
+        if [[ query_result -eq 0 ]]; then
+            # If the update is not in the database, add it
+            echo "Adding update '$update' to host '$SERVER_NAME' database"
+            sqlite3 "$db_path" "INSERT INTO host_updates (host_id,update_id,installed,failed,empty) VALUES ('$HOST_ID','$update_id',$installed,$failed,$empty);"
+        fi
+
+        # If no files in the update are in the database, mark update as empty
+        file_count=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM files WHERE update_id='$update_id';")
+        failed_count=$(sqlite3 "$db_path" "SELECT COUNT(hf.id) FROM host_files hf JOIN files f ON hf.file_id = f.id WHERE hf.host_id='$HOST_ID' AND (f.deleted IS NULL OR f.deleted = 0) AND f.update_id='$update_id' AND (hf.failed NOT NULL AND NOT(hf.failed=0));")
+        uninstalled_count=$(sqlite3 "$db_path" "SELECT COUNT(hf.id) FROM host_files hf JOIN files f ON hf.file_id = f.id WHERE hf.host_id='$HOST_ID' AND (f.deleted IS NULL OR f.deleted = 0) AND f.update_id='$update_id' AND (hf.installed IS NULL OR hf.installed=0);")
+
+        if [[ $file_count -eq 0 ]]; then
+            empty=1
+        # If any file in the database has failed, mark update as failed
+        elif [[ $failed_count -gt 0 ]]; then
+            failed=1
+        # If every file in the database is installed, mark update as installed
+        elif [[ $uninstalled_count -eq 0 ]]; then
+            installed=1
+        fi
+
+        # Update status of the update
+        sqlite3 "$db_path" "UPDATE host_updates SET installed=$installed, failed=$failed, empty=$empty WHERE host_id='$HOST_ID' AND update_id='$update_id'"
     done
 
     # Check that every update in the database is present in $updates, and mark
     # any updates that are not present as deleted
     for update in $(sqlite3 "$db_path" "SELECT name FROM updates;"); do
-        if ! echo "$updates" | grep -q "$update"; then
+        if ! find "$BASE_PATH" -type d -name "$update" | grep -q "$update"; then
             echo "Marking update '$update' as deleted"
             sqlite3 "$db_path" "UPDATE updates SET deleted=1 WHERE name='$update';"
         fi
@@ -163,23 +209,42 @@ function refresh_files {
         # Get base name of file and extension as separate variables
         local file_name=$(basename "$file")
         local file_extension="${file_name##*.}"
+        local file_id=""
+        local query_result=""
         file_name="${file_name%.*}"
 
         # Check if the file is in the database
-        if ! sqlite3 "$db_path" "SELECT id FROM files WHERE name='$file';" | grep -q "$file"; then
+        query_result=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM files WHERE name='$file_name' AND extension = '$file_extension' AND update_id = '$update_id';")
+        if [[ query_result -eq 0 ]]; then
             # If the file is not in the database, add it
             echo "Adding file '$file' to database"
             sqlite3 "$db_path" "INSERT INTO files (name,extension,added_at,update_id) VALUES ('$file_name','$file_extension',datetime('now'),$update_id);"
+        fi
+
+        # Get the file id
+        file_id=$(sqlite3 "$db_path" "SELECT id FROM files WHERE name='$file_name' AND extension='$file_extension' AND update_id=$update_id;")
+
+        # Ensure the host_files table has an entry for the file
+        query_result=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM host_files WHERE host_id='$HOST_ID' AND file_id='$file_id';")
+        if [[ query_result -eq 0 ]]; then
+            # If the file is not in the database, add it
+            echo "Adding file '$file' to host '$SERVER_NAME' database"
+            sqlite3 "$db_path" "INSERT INTO host_files (host_id,file_id,installed,failed) VALUES ('$HOST_ID','$file_id',0,0);"
         fi
     done
 
     # Check that every file in the database is present in the directory, and mark
     # any files that are not present as deleted
-    for file in $(sqlite3 "$db_path" "SELECT name FROM files;"); do
-        if ! find "${BASE_PATH}$1" -type f | grep -q "$file"; then
-            echo "Marking file '$file' as deleted"
-            sqlite3 "$db_path" "UPDATE files SET deleted=1 WHERE name='$file';"
-        fi
+    for file in $(sqlite3 "$db_path" "SELECT name,extension FROM files WHERE update_id = '$update_id' AND deleted IS NULL OR deleted = 0;"); do
+        while IFS='|' read -r name extension; do
+            local file_name="${name}.${extension}"
+            echo "File name: $file_name"
+            echo "Command: find ${BASE_PATH}$1 -type f -name '$file_name'"
+            if ! find "${BASE_PATH}$1" -type f -name "$file_name" | grep -q "$file_name"; then
+                echo "Marking file '${BASE_PATH}$1/$file_name' as deleted"
+                sqlite3 "$db_path" "UPDATE files SET deleted=1 WHERE name='$file';"
+            fi
+        done < <(echo "$file")
     done
 }
 
@@ -193,11 +258,47 @@ function updates_menu {
         return 1
     fi
 
-    while IFS='|' read -r id name; do
+    local query="
+    SELECT
+        u.id,
+        u.name,
+        COALESCE(uh.installed, 0) as installed,
+        COALESCE(uh.failed, 0) as failed,
+        COALESCE(uh.empty, 0) as empty
+    FROM updates u
+    LEFT JOIN host_updates uh ON u.id = uh.update_id AND uh.host_id = '$HOST_ID'
+    WHERE u.deleted IS NULL OR u.deleted = 0
+    ORDER BY u.name DESC;
+    "
+
+    # Read files and build menu items
+    while IFS='|' read -r id name installed failed empty; do
         if [[ -n "$id" && -n "$name" ]]; then
-            menu_items+=($id $name)
+            local status_display=""
+            local status_colour=""
+
+            if [[ $failed == "1" ]]; then
+                status_display="FAILED"
+                status_color="\Z1"
+            elif [[ $installed == "1" ]]; then
+                status_display="INSTALLED"
+                status_color="\Z2"
+            elif [[ $empty == "1" ]]; then
+                status_display="EMPTY"
+                status_color="\Z3"
+            else
+                status_display="-"
+                status_color="\Z3"
+            fi
+
+            local padding_length=$((20 - ${#name}))
+            padding_length=$(($padding_length < 0 ? 0 : $padding_length))
+
+            local padding=$(printf "%*s" "$padding_length" "" | tr ' ' '.')
+            local display_text="${name}${padding}[${status_color}${status_display}\Zn]"
+            menu_items+=($id $display_text)
         fi
-    done < <(sqlite3 "$db_path" "SELECT id, name FROM updates WHERE deleted IS NULL OR deleted = 0 ORDER BY name DESC;")
+    done < <(sqlite3 "$db_path" "$query")
 
     if [[ ${#menu_items[@]} -eq 0 ]]; then
         dialog --title "No Updates" --msgbox "No updates found" 10 50
@@ -205,6 +306,7 @@ function updates_menu {
     fi
 
     dialog \
+        --colors \
         --title "Server Updater" \
         --menu "Select an update:" \
         20 60 40 \
@@ -237,8 +339,6 @@ function files_menu {
         return 1
     fi
 
-    local server_id=$(sqlite3 "$db_path" "SELECT id FROM hosts WHERE name='$SERVER_NAME';")
-    
     local query="
     SELECT
         f.id,
@@ -250,7 +350,7 @@ function files_menu {
         COALESCE(hf.installed, 0) as installed,
         COALESCE(hf.failed, 0) as failed
     FROM files f
-    LEFT JOIN host_files hf ON f.id = hf.file_id AND hf.host_id = '$server_id'
+    LEFT JOIN host_files hf ON f.id = hf.file_id AND hf.host_id = '$HOST_ID'
     WHERE f.update_id = $update_id
     AND f.deleted IS NULL OR f.deleted = 0
     ORDER BY full_name ASC;
@@ -273,10 +373,11 @@ function files_menu {
                 status_color="\Z3"
             fi
 
-            # local display_text=$(printf "%-40s %s%s\Zn" "$name" "$status_colour" "$status_display")
-            local display_text="${name}[${status_color}${status_display}\Zn]"
-            # local padded_name=$(printf "%-40s" "$name")
-            # local display_text=$("${padded_name} ${status_colour}${status_display}\Zn")
+            local padding_length=$((30 - ${#name}))
+            padding_length=$(($padding_length < 0 ? 0 : $padding_length))
+
+            local padding=$(printf "%*s" "$padding_length" "" | tr ' ' '.')
+            local display_text="${name}${padding}[${status_color}${status_display}\Zn]"
             menu_items+=($id $display_text)
         fi
     done < <(sqlite3 "$db_path" "$query")
@@ -291,7 +392,7 @@ function files_menu {
 
     dialog \
         --colors \
-        --title "Files in '$update_name'" \
+        --title "Files in '$SELECTED_UPDATE'" \
         --menu "Select files to install:" \
         25 80 15 \
         "${menu_items[@]}" \
