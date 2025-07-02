@@ -127,7 +127,7 @@ function refresh_updates {
         refresh_files "$update"
 
         # If any file in the update is not in the database, add it
-        for file in $(find "$BASE_PATH$update" -type f); do
+        for file in $(find "$BASE_PATH$update" -type f ! -name ".*"); do
             # Get base name of file and extension as separate variables
             local file_name=$(basename "$file")
             local file_extension="${file_name##*.}"
@@ -205,7 +205,7 @@ function refresh_files {
     fi
 
     # Check that every file in the directory is in the database
-    for file in $(find "${BASE_PATH}$1" -type f); do
+    for file in $(find "${BASE_PATH}$1" -type f ! -name ".*"); do
         # Get base name of file and extension as separate variables
         local file_name=$(basename "$file")
         local file_extension="${file_name##*.}"
