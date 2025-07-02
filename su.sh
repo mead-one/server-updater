@@ -150,7 +150,7 @@ function refresh_updates {
         fi
 
         # If no files in the update are in the database, mark update as empty
-        file_count=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM files WHERE update_id='$update_id';")
+        file_count=$(sqlite3 "$db_path" "SELECT COUNT(id) FROM files WHERE update_id='$update_id' AND (deleted IS NULL OR deleted = 0);")
         failed_count=$(sqlite3 "$db_path" "SELECT COUNT(hf.id) FROM host_files hf JOIN files f ON hf.file_id = f.id WHERE hf.host_id='$HOST_ID' AND (f.deleted IS NULL OR f.deleted = 0) AND f.update_id='$update_id' AND (hf.failed NOT NULL AND NOT(hf.failed=0));")
         uninstalled_count=$(sqlite3 "$db_path" "SELECT COUNT(hf.id) FROM host_files hf JOIN files f ON hf.file_id = f.id WHERE hf.host_id='$HOST_ID' AND (f.deleted IS NULL OR f.deleted = 0) AND f.update_id='$update_id' AND (hf.installed IS NULL OR hf.installed=0);")
 
@@ -238,14 +238,53 @@ function refresh_files {
     for file in $(sqlite3 "$db_path" "SELECT name,extension FROM files WHERE update_id = '$update_id' AND deleted IS NULL OR deleted = 0;"); do
         while IFS='|' read -r name extension; do
             local file_name="${name}.${extension}"
-            echo "File name: $file_name"
-            echo "Command: find ${BASE_PATH}$1 -type f -name '$file_name'"
             if ! find "${BASE_PATH}$1" -type f -name "$file_name" | grep -q "$file_name"; then
                 echo "Marking file '${BASE_PATH}$1/$file_name' as deleted"
-                sqlite3 "$db_path" "UPDATE files SET deleted=1 WHERE name='$file';"
+                sqlite3 "$db_path" "UPDATE files SET deleted=1 WHERE name='$name' AND extension='$extension' AND update_id='$update_id';"
             fi
         done < <(echo "$file")
     done
+}
+
+# Show main menu, using dialog
+function main_menu {
+    local temp_file=$(mktemp)
+    local menu_items=()
+
+    menu_items+=("UPDATES" "Update Server")
+    
+    menu_items+=("QUIT" "Quit")
+
+    dialog \
+        --colors \
+        --title "Server Updater" \
+        --menu "Select an option:" \
+        20 60 40 \
+        "${menu_items[@]}" \
+        2> "$temp_file"
+
+    local exit_code=$?
+
+    if [[ $exit_code -eq 0 ]]; then
+        SELECTED_ID=$(cat "$temp_file" | sed -E 's/^([0-9]+).*/\1/')
+        SELECTED_UPDATE=$(cat "$temp_file" | sed -E 's/^[0-9]+ (.*)/\1/')
+
+        rm -f "$temp_file"
+
+        case "$SELECTED_ID" in
+            "UPDATES")
+                ACTION="UPDATES"
+                return 0
+                ;;
+            "QUIT")
+                ACTION="QUIT"
+                return 0
+                ;;
+        esac
+    else
+        rm -f "$temp_file"
+        return 1
+    fi
 }
 
 # Show update menu, using dialog
@@ -442,37 +481,47 @@ function files_menu {
 
 function run_update_workflow {
     while true; do
-        if updates_menu; then
-            if [[ $updates_status -ne 0 ]]; then
-                echo "Exiting due to error"
-                exit 1
-            fi
+        if main_menu; then
+            case "$ACTION" in
+                "UPDATES")
+                    if updates_menu; then
+                        if [[ $updates_status -ne 0 ]]; then
+                            echo "Exiting due to error"
+                            exit 1
+                        fi
 
-            if files_menu "$SELECTED_ID" "$SELECTED_UPDATE"; then
-                echo "Files menu action: $ACTION"
+                        if files_menu "$SELECTED_ID" "$SELECTED_UPDATE"; then
+                            echo "Files menu action: $ACTION"
 
-                case "$ACTION" in
-                    "INSTALL_ALL")
-                        echo "Installing all files for update $UPDATE_ID"
-                        read -r ans
-                        ;;
-                    "INSTALL_FAILED")
-                        echo "Retrying failed files for update $UPDATE_ID"
-                        read -r ans
-                        ;;
-                    "INSTALL_FILE")
-                        echo "Installing file $FILENAME for update $UPDATE_ID"
-                        read -r ans
-                        ;;
-                esac
+                            case "$ACTION" in
+                                "INSTALL_ALL")
+                                    echo "Installing all files for update $UPDATE_ID"
+                                    read -r ans
+                                    ;;
+                                "INSTALL_FAILED")
+                                    echo "Retrying failed files for update $UPDATE_ID"
+                                    read -r ans
+                                    ;;
+                                "INSTALL_FILE")
+                                    echo "Installing file $FILENAME for update $UPDATE_ID"
+                                    read -r ans
+                                    ;;
+                            esac
 
-                if ! dialog --yesno "Continue with another operation?" 8 40; then
+                            if ! dialog --yesno "Continue with another operation?" 8 40; then
+                                break
+                            fi
+                        fi
+                    else
+                        echo "Updates menu cancelled or failed"
+                        break
+                    fi
+                    ;;
+                "QUIT")
+                    echo "Exiting due to user request"
                     break
-                fi
-            fi
-        else
-            echo "Updates menu cancelled or failed"
-            break
+                    ;;
+            esac
         fi
     done
 }
